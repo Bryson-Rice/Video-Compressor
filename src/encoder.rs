@@ -1,5 +1,4 @@
-
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,8 +41,7 @@ pub enum EncoderMessage {
 }
 
 
-// The active FFmpeg child is stored here too, so cancel() can kill it
-// immediately rather than waiting for it to notice the flag
+// Active ffmpeg child stored here too so cancel() can kill it immediately instead of waiting for it to notice the flag
 #[derive(Clone, Default)]
 pub struct CancelToken {
     pub flag: Arc<AtomicBool>,
@@ -103,7 +101,7 @@ pub fn is_supported(path: &Path) -> bool {
     is_image_ext(path) || is_video_ext(path)
 }
 
-// Folders are scanned one level deep (non-recursive) because I dont want to deal with multiple levels of folders
+// Scans one level deep only - not dealing with recursive folder walks for this
 pub fn collect_files(path: &Path) -> Vec<PathBuf> {
     if path.is_file() {
         if is_supported(path) {
@@ -201,8 +199,78 @@ struct FfprobeStream {
 }
 
 
-// Creates a `Command` for the given path with the console window hidden on
-// Windows (`CREATE_NO_WINDOW`). On other platforms this is a plain `Command::new`
+// Follows each OS's normal spot for this instead of dumping into the app folder or temp dir:
+//   Windows -> %LOCALAPPDATA%\VideoCompressor\logs
+//   macOS   -> ~/Library/Logs/VideoCompressor
+//   Linux   -> ~/.local/state/video-compressor/logs
+// Falls back to the temp dir if the relevant env var isn't set, so a missing var never blocks an encode
+fn error_log_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            return PathBuf::from(local_appdata).join("VideoCompressor").join("logs");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join("Library").join("Logs").join("VideoCompressor");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join(".local").join("state").join("video-compressor").join("logs");
+        }
+    }
+    std::env::temp_dir().join("VideoCompressor").join("logs")
+}
+
+// pub so the UI can wire up an "open error log" button instead of making the user hunt for the path
+pub fn error_log_path() -> PathBuf {
+    error_log_dir().join("error.txt")
+}
+
+// Appends rather than overwrites so a retry's outcome doesn't erase the original failure, usually the more useful one. Best-effort - a failed write (no permissions, etc.) never fails the encode itself
+fn write_error_log(ffmpeg: &Path, args: &[String], exit_code: Option<i32>, stderr: &str) -> Option<PathBuf> {
+    let dir = error_log_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("error.txt");
+
+    let unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let command_line = std::iter::once(ffmpeg.display().to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let exit_desc = exit_code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "unknown (terminated by signal)".to_string());
+
+    let entry = format!(
+        "===== {unix_secs} (unix time) =====\n\
+         Exit code: {exit_desc}\n\
+         Command: {command_line}\n\
+         --- ffmpeg output ---\n\
+         {stderr}\n\n"
+    );
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    file.write_all(entry.as_bytes()).ok()?;
+
+    Some(path)
+}
+
+// Without this ffmpeg would flash a console window on Windows, since this is a GUI app spawning a console program - no-op elsewhere
 fn no_window_command(program: &Path) -> Command {
     let mut cmd = Command::new(program);
     #[cfg(target_os = "windows")]
@@ -301,7 +369,7 @@ fn run_ffmpeg(
     let mut args: Vec<String> = vec![
         "-y".into(),
         "-progress".into(), "pipe:1".into(),
-        "-v".into(), "quiet".into(),
+        "-v".into(), "error".into(),
         "-nostats".into(),
     ];
     args.extend_from_slice(input_args);
@@ -310,7 +378,7 @@ fn run_ffmpeg(
     let mut child = no_window_command(ffmpeg)
         .args(&args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
             format!(
@@ -319,11 +387,11 @@ fn run_ffmpeg(
             )
         })?;
 
-    // Must take stdout before the child moves into the mutex below
+    // Must take stdout/stderr before the child moves into the mutex below
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
 
-    // Stored here so the UI thread can kill it via cancel() - see the
-    // polling loop below for why we don't just hold this and call wait()
+    // Stored here so the UI thread can kill it via cancel() - see the polling loop below for why we don't just call wait()
     if let Ok(mut guard) = cancel.child.lock() {
         *guard = Some(child);
     }
@@ -340,10 +408,17 @@ fn run_ffmpeg(
         }
     });
 
-    // Poll with try_wait() rather than a single blocking wait(): a blocking
-    // wait() would hold the mutex the whole run, and cancel() would never
-    // get a chance to lock it and kill the process. Polling keeps the mutex
-    // free between checks so a Cancel click takes effect within one interval
+    // ffmpeg's real diagnostics go to stderr, not stdout - captured here so a failure can be logged with actual detail instead of just "exited with an error"
+    let stderr_thread = std::thread::spawn(move || {
+        let mut captured = String::new();
+        for line in BufReader::new(stderr).lines().flatten() {
+            captured.push_str(&line);
+            captured.push('\n');
+        }
+        captured
+    });
+
+    // Polls with try_wait() instead of a blocking wait() - a blocking wait() would hold the mutex the whole run and cancel() could never lock it to kill the process, so polling frees the mutex between checks and Cancel takes effect within one interval
     let status: std::io::Result<std::process::ExitStatus> = loop {
         let polled = {
             let mut guard = cancel.child.lock().unwrap();
@@ -359,6 +434,7 @@ fn run_ffmpeg(
         }
     };
     let _ = progress_thread.join();
+    let captured_stderr = stderr_thread.join().unwrap_or_default();
 
     if let Ok(mut guard) = cancel.child.lock() {
         *guard = None;
@@ -370,7 +446,16 @@ fn run_ffmpeg(
 
     match status {
         Ok(s) if s.success() => Ok(()),
-        Ok(_) => Err("FFmpeg exited with an error. The file may be unsupported or corrupt.".into()),
+        Ok(s) => {
+            let log_path = write_error_log(ffmpeg, &args, s.code(), &captured_stderr);
+            Err(match log_path {
+                Some(p) => format!(
+                    "FFmpeg exited with an error. Details saved to {}",
+                    p.display()
+                ),
+                None => "FFmpeg exited with an error. The file may be unsupported or corrupt.".into(),
+            })
+        }
         Err(e) => Err(format!("FFmpeg process error: {}", e)),
     }
 }
@@ -455,9 +540,7 @@ pub fn run_batch(
 }
 
 
-// Falls back to the source folder if a custom output folder can't be
-// created (e.g. it was on USB that's since been unplugged),
-// so the encode still succeeds somewhere sensible
+// Falls back to the source folder if the custom output dir can't be created (e.g. a USB drive that's since been unplugged) - the encode should still land somewhere sensible
 fn resolve_output_dir(input: &Path, output_dir: Option<&Path>) -> PathBuf {
     let source_dir = input.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
 
@@ -545,9 +628,7 @@ fn compress_video_inner(
 
     if let Err(e) = &result {
         if e == "cancelled" {
-            // Cancel now kills ffmpeg immediately, mid-write, so whatever it
-            // managed to flush to `output` is an incomplete/corrupt file -
-            // clean it up rather than leaving it sitting in the output folder
+            // Cancel kills ffmpeg mid-write, so whatever's in `output` is an incomplete/corrupt file - clean it up rather than leaving it in the output folder
             let _ = std::fs::remove_file(&output);
         }
     }
@@ -716,8 +797,7 @@ fn encode_jpeg_bytes(img: &image::DynamicImage, quality: u8) -> Vec<u8> {
 }
 
 fn scale_to_fit(img: &image::DynamicImage, target_bytes: usize) -> image::DynamicImage {
-    // Raw pixel bytes as a cheap stand-in for encoded size while searching for
-    // a scale factor - real JPEG encoding only happens once, at the end
+    // Raw pixel bytes stand in for encoded size while searching for a scale factor - actually encoding JPEG at every step would be far too slow, so real encoding only happens once at the end
     let channels = img.color().channel_count() as u32;
     let raw_size_at = |w: u32, h: u32| (w * h * channels) as usize;
 

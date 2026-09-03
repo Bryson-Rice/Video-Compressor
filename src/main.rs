@@ -1,6 +1,6 @@
 #![windows_subsystem = "windows"]
 
-// TODO: make one thing handle which file types or supported rather than manually updating 3 different locations
+// TODO: extensions are hardcoded in 3 places (main.rs, encoder.rs, windows_shell.rs) instead of one shared list - fix this properly instead of hoping they stay in sync
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, Vec2};
 use std::path::{Path, PathBuf};
@@ -14,10 +14,11 @@ use encoder::{
 #[cfg(target_os = "windows")]
 mod windows_shell;
 
+#[cfg(not(target_os = "windows"))]
+mod settings;
+
 fn main() -> eframe::Result<()> {
-    // Runs unconditionally on every launch (not gated on is_registered())
-    // so a partial/stale registration from an older build self-heals
-    // instead of getting stuck forever. Cheap HKCU-only writes
+    // Re-registers every launch instead of checking is_registered() first, so a stale registration from an old build self-heals - it's just a couple cheap HKCU writes
     #[cfg(target_os = "windows")]
     {
         if let Ok(exe) = std::env::current_exe() {
@@ -25,8 +26,7 @@ fn main() -> eframe::Result<()> {
         }
     }
 
-    // "Open with" / drop-on-exe pass the file path as argv[1]; grab it
-    // before the event loop starts so it can be pre-loaded
+    // "Open with" / drag-onto-exe pass the file as argv[1] - grab it before the event loop starts so it can be pre-loaded
     let initial_path: Option<std::path::PathBuf> =
         std::env::args_os().nth(1).map(Into::into);
 
@@ -59,26 +59,6 @@ fn main() -> eframe::Result<()> {
             cc.egui_ctx.set_style(style);
 
             let mut app = App::default();
-
-            // Registry settings only exist on Windows (loaded in App::default());
-            // eframe's cross-platform storage covers these two so custom MB
-            // targets also persist on macOS/Linux
-            if let Some(storage) = cc.storage {
-                if let Some(s) = storage.get_string("custom_mb_video") {
-                    if let Ok(v) = s.parse::<f64>() {
-                        let v = v.clamp(0.1, 2000.0);
-                        app.custom_mb_video = v;
-                        app.custom_mb_video_str = v.to_string();
-                    }
-                }
-                if let Some(s) = storage.get_string("custom_mb_image") {
-                    if let Ok(v) = s.parse::<f64>() {
-                        let v = v.clamp(0.1, 2000.0);
-                        app.custom_mb_image = v;
-                        app.custom_mb_image_str = v.to_string();
-                    }
-                }
-            }
 
             if let Some(path) = initial_path {
                 app.load_path(path);
@@ -176,21 +156,32 @@ struct App {
 
 impl App {
     // (custom_mb_video, custom_mb_image, mute, two_pass, output_dir)
-    // Falls back to defaults on non-Windows builds or first run
+    #[cfg(target_os = "windows")]
     fn load_saved_settings() -> (f64, f64, bool, bool, Option<PathBuf>) {
-        #[cfg(target_os = "windows")]
-        {
-            let s = windows_shell::load_settings();
-            (s.custom_mb_video, s.custom_mb_image, s.mute, s.two_pass, s.output_dir)
-        }
-        #[cfg(not(target_os = "windows"))]
-        { (50.0, 5.0, false, true, None) }
+        let s = windows_shell::load_settings();
+        (s.custom_mb_video, s.custom_mb_image, s.mute, s.two_pass, s.output_dir)
     }
 
-    // No-op on non-Windows builds - nowhere durable to put settings there yet
+    #[cfg(not(target_os = "windows"))]
+    fn load_saved_settings() -> (f64, f64, bool, bool, Option<PathBuf>) {
+        let s = settings::load_settings();
+        (s.custom_mb_video, s.custom_mb_image, s.mute, s.two_pass, s.output_dir)
+    }
+
+    #[cfg(target_os = "windows")]
     fn persist_settings(&self) {
-        #[cfg(target_os = "windows")]
         windows_shell::save_settings(&windows_shell::AppSettings {
+            custom_mb_video: self.custom_mb_video,
+            custom_mb_image: self.custom_mb_image,
+            mute: self.mute,
+            two_pass: self.two_pass,
+            output_dir: self.output_dir.clone(),
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn persist_settings(&self) {
+        settings::save_settings(&settings::AppSettings {
             custom_mb_video: self.custom_mb_video,
             custom_mb_image: self.custom_mb_image,
             mute: self.mute,
@@ -242,8 +233,7 @@ impl eframe::App for App {
         self.poll_encoder(ctx);
         self.handle_drops(ctx);
 
-        // Must be declared before CentralPanel so it pins to the viewport
-        // bottom regardless of the central panel's scroll position
+        // Must come before CentralPanel or it won't pin to the viewport bottom regardless of scroll position
         egui::TopBottomPanel::bottom("output_footer")
             .show_separator_line(true)
             .show(ctx, |ui| {
@@ -445,8 +435,7 @@ impl App {
             AppState::Encoding => self.render_encoding_screen(ui),
             _ => {
                 self.render_main_screen(ui);
-                // Results show below the drop zone rather than replacing it,
-                // so loading a new file doesn't require dismissing anything
+                // Results show below the drop zone instead of replacing it, so loading a new file doesn't require dismissing anything first
                 if matches!(self.state, AppState::Done | AppState::Cancelled) {
                     self.render_results_panel(ui);
                 }
@@ -736,7 +725,6 @@ impl App {
 
                 ui.add_space(6.0);
 
-                // lets the user get back to same as source
                 let reset_enabled = self.output_dir.is_some();
                 if ui
                     .add_enabled(
@@ -946,29 +934,44 @@ impl App {
                 }
             });
 
-        if let Some(first) = self.completed.first() {
-            if let Some(parent) = first.parent() {
-                let parent = parent.to_path_buf();
+        ui.horizontal(|ui| {
+            if let Some(first) = self.completed.first() {
+                if let Some(parent) = first.parent() {
+                    let parent = parent.to_path_buf();
+                    ui.add_space(8.0);
+                    if ui
+                        .add(
+                            egui::Button::new("Open Output Folder")
+                                .min_size(Vec2::new(180.0, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        open_in_explorer(&parent);
+                    }
+                }
+            }
+
+            if !self.errors.is_empty() {
                 ui.add_space(8.0);
                 if ui
                     .add(
-                        egui::Button::new("Open Output Folder")
-                            .min_size(Vec2::new(180.0, 30.0)),
+                        egui::Button::new(RichText::new("Open Error Log").color(Color32::from_gray(200)))
+                            .fill(Color32::from_gray(50))
+                            .min_size(Vec2::new(140.0, 30.0)),
                     )
                     .clicked()
                 {
-                    open_in_explorer(&parent);
+                    open_in_explorer(&encoder::error_log_path());
                 }
             }
-        }
+        });
 
         ui.add_space(10.0);
     }
 }
 
 
-// Opens the given folder in the OS's default file explorer
-// if the command fails to spawn, this silently does nothing
+// Silently no-ops if this fails to spawn (e.g. xdg-open missing) - it's a convenience button, not worth erroring over
 fn open_in_explorer(path: &Path) {
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("explorer").arg(path).spawn();
@@ -978,8 +981,7 @@ fn open_in_explorer(path: &Path) {
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
 
-// Converts an f64 MB value to a display string without unnecessary decimal places
-// `50.0` → `"50"`, `1.5` → `"1.5"`, `150.0` → `"150"`
+// The target-size text field edits a String, not the f64 directly, so this exists to seed it - trims ".0" off whole numbers so "50" doesn't show up as "50.0"
 fn mb_to_str(mb: f64) -> String {
     if mb.fract() == 0.0 {
         format!("{}", mb as u64)

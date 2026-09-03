@@ -1,4 +1,3 @@
-
 use std::path::{Path, PathBuf};
 use winreg::enums::*;
 use winreg::RegKey;
@@ -7,14 +6,13 @@ const PROG_ID: &str = "VideoCompressor.File";
 const FRIENDLY_TYPE_NAME: &str = "Video Compressor File";
 const VERB_FRIENDLY_NAME: &str = "Compress with Video Compressor";
 
-// Every extension this app can handle. Must stay in sync with encoder.rs | this is shit 
+// Every extension this app can handle, kept in sync with main.rs and encoder.rs by hand - this is shit and should be one shared list
 const ALL_EXTS: &[&str] = &[
     "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mts",
     "jpg", "jpeg", "png", "bmp", "gif",
 ];
 
-// We call this after any registry change so Explorer picks up the new
-// associations immediately without requiring a logoff/reboot
+// Called after any registry change so Explorer picks up the new associations immediately, no logoff/reboot needed
 
 #[link(name = "shell32")]
 extern "system" {
@@ -37,10 +35,7 @@ pub fn is_registered() -> bool {
         .is_ok()
 }
 
-// Writes a ProgID (VideoCompressor.File, with its icon and open command)
-// plus an OpenWithProgids entry under each supported extension - the
-// standard way to appear in "Open with" without becoming the default handler
-// Everything is under HKCU, so no elevation is needed
+// Writes a ProgID with an icon/open command, plus an OpenWithProgids entry per extension - shows up in "Open With" without becoming the forced default handler. All under HKCU, so no elevation prompt
 pub fn register(exe_path: &Path) -> std::io::Result<()> {
     let exe_str = exe_path.to_string_lossy();
     let exe_quoted = format!("\"{}\"", exe_str);
@@ -107,8 +102,7 @@ fn notify_shell() {
     }
 }
 
-// Stored under HKCU\Software\VideoCompressor\Settings as REG_SZ / REG_DWORD
-// values so they're human-readable in regedit if needed
+// Stored as REG_SZ/REG_DWORD under HKCU\Software\VideoCompressor\Settings so they're human-readable in regedit if you ever need to poke at them
 
 const SETTINGS_KEY: &str = "Software\\VideoCompressor\\Settings";
 const VAL_CUSTOM_MB_VIDEO: &str = "CustomMbVideo";
@@ -120,7 +114,6 @@ const VAL_OUTPUT_DIR: &str = "OutputDir";
 pub const DEFAULT_CUSTOM_MB_VIDEO: f64 = 50.0;
 pub const DEFAULT_CUSTOM_MB_IMAGE: f64 = 5.0;
 
-// User settings
 pub struct AppSettings {
     pub custom_mb_video: f64,
     pub custom_mb_image: f64,
@@ -174,8 +167,7 @@ pub fn load_settings() -> AppSettings {
         .map(|v| v != 0)
         .unwrap_or(true);
 
-    // Empty string (or missing value) means "no custom folder set" - fall
-    // back to the default of writing output next to each source file
+    // Empty string (or missing value) means "no custom folder set" - falls back to writing output next to each source file
     let output_dir = key
         .get_value::<String, _>(VAL_OUTPUT_DIR)
         .ok()
@@ -185,8 +177,7 @@ pub fn load_settings() -> AppSettings {
     AppSettings { custom_mb_video, custom_mb_image, mute, two_pass, output_dir }
 }
 
-// Persists all settings to the registry. Called on every encode start
-// Silently ignores errors - best-effort only
+// Called on every encode start. Silently ignores errors - if the write fails, settings just don't stick this session, not worth surfacing
 pub fn save_settings(s: &AppSettings) {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     if let Ok((key, _)) = hkcu.create_subkey(SETTINGS_KEY) {
