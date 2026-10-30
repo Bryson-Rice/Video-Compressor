@@ -15,9 +15,6 @@ use encoder::{
 mod windows_shell;
 
 fn main() -> eframe::Result<()> {
-    // Runs unconditionally on every launch (not gated on is_registered())
-    // so a partial/stale registration from an older build self-heals
-    // instead of getting stuck forever. Cheap HKCU-only writes
     #[cfg(target_os = "windows")]
     {
         if let Ok(exe) = std::env::current_exe() {
@@ -25,8 +22,7 @@ fn main() -> eframe::Result<()> {
         }
     }
 
-    // "Open with" / drop-on-exe pass the file path as argv[1]; grab it
-    // before the event loop starts so it can be pre-loaded
+    // "Open with" / drop-on-exe pass the file path as argv[1]
     let initial_path: Option<std::path::PathBuf> =
         std::env::args_os().nth(1).map(Into::into);
 
@@ -163,14 +159,16 @@ struct App {
     current_file_index: usize,
     total_files: usize,
     current_file_name: String,
-    current_file_is_image: bool,  // drives whether the two-pass UI applies
+    current_file_is_image: bool,  // we dont care about doing two pass for images, images most of the time are very small anyway
 
     // Results
     completed: Vec<PathBuf>,
     errors: Vec<String>,
-    error: Option<String>,        // load-time error, distinct from per-file encode errors
+    warnings: Vec<String>,
+    skipped: Vec<String>,
+    error: Option<String>,
 
-    // `None` = write output next to the source file 
+    // None = write output next to the source file 
     output_dir: Option<PathBuf>,
 }
 
@@ -230,6 +228,8 @@ impl Default for App {
             current_file_is_image: false,
             completed: Vec::new(),
             errors: Vec::new(),
+            warnings: Vec::new(),
+            skipped: Vec::new(),
             error: None,
             output_dir,
         }
@@ -296,6 +296,18 @@ impl App {
                     EncoderMessage::FileDone(path) => {
                         self.completed.push(path);
                         self.file_progress = 1.0;
+                    }
+                    EncoderMessage::FallbackUsed { name, reason, retry } => {
+                        self.warnings.push(format!(
+                            "{}: two-pass encode failed and was retried {} ({}). Output may differ slightly from expected.",
+                            name, retry, reason
+                        ));
+                    }
+                    EncoderMessage::Skipped { name, reason } => {
+                        self.skipped.push(format!("{}: {}", name, reason));
+                    }
+                    EncoderMessage::OutputNote { name, text } => {
+                        self.warnings.push(format!("{}: {}", name, text));
                     }
                     EncoderMessage::FileError { name, error } => {
                         self.errors.push(format!("{}: {}", name, error));
@@ -416,6 +428,8 @@ impl App {
         self.state = AppState::Encoding;
         self.completed.clear();
         self.errors.clear();
+        self.warnings.clear();
+        self.skipped.clear();
         self.pass1_progress = 0.0;
         self.pass2_progress = 0.0;
         self.file_progress = 0.0;
@@ -788,12 +802,22 @@ impl App {
                     .color(Color32::from_gray(160))
                     .size(12.0),
             );
+
+            if let Some(last) = self.warnings.last() {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("⚠ {}", last))
+                        .color(Color32::from_rgb(230, 180, 60))
+                        .size(11.0),
+                );
+            }
+
             ui.add_space(24.0);
 
             let bar_width = (ui.available_width() - 40.0).min(460.0);
 
             if self.total_files > 1 {
-                let done = self.completed.len() + self.errors.len();
+                let done = self.completed.len() + self.errors.len() + self.skipped.len();
                 let overall = done as f32 / self.total_files as f32;
 
                 ui.label(
@@ -892,6 +916,8 @@ impl App {
                 {
                     self.completed.clear();
                     self.errors.clear();
+                    self.warnings.clear();
+                    self.skipped.clear();
                     self.state = AppState::Idle;
                 }
             });
@@ -906,15 +932,15 @@ impl App {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
 
-                ui.label(
-                    RichText::new(format!(
-                        "{} compressed,  {} failed",
-                        self.completed.len(),
-                        self.errors.len(),
-                    ))
-                    .strong()
-                    .size(13.0),
+                let mut summary = format!(
+                    "{} compressed,  {} failed",
+                    self.completed.len(),
+                    self.errors.len(),
                 );
+                if !self.skipped.is_empty() {
+                    summary.push_str(&format!(",  {} skipped", self.skipped.len()));
+                }
+                ui.label(RichText::new(summary).strong().size(13.0));
 
                 if !self.completed.is_empty() {
                     ui.add_space(8.0);
@@ -934,6 +960,17 @@ impl App {
                     }
                 }
 
+                if !self.skipped.is_empty() {
+                    ui.add_space(6.0);
+                    for skip in &self.skipped {
+                        ui.label(
+                            RichText::new(format!("  Skipped: {}", skip))
+                                .color(Color32::from_gray(160))
+                                .size(12.0),
+                        );
+                    }
+                }
+
                 if !self.errors.is_empty() {
                     ui.add_space(6.0);
                     for err in &self.errors {
@@ -944,23 +981,50 @@ impl App {
                         );
                     }
                 }
+
+                if !self.warnings.is_empty() {
+                    ui.add_space(6.0);
+                    for warn in &self.warnings {
+                        ui.label(
+                            RichText::new(format!("  ⚠ {}", warn))
+                                .color(Color32::from_rgb(230, 180, 60))
+                                .size(12.0),
+                        );
+                    }
+                }
             });
 
-        if let Some(first) = self.completed.first() {
-            if let Some(parent) = first.parent() {
-                let parent = parent.to_path_buf();
+        ui.horizontal(|ui| {
+            if let Some(first) = self.completed.first() {
+                if let Some(parent) = first.parent() {
+                    let parent = parent.to_path_buf();
+                    ui.add_space(8.0);
+                    if ui
+                        .add(
+                            egui::Button::new("Open Output Folder")
+                                .min_size(Vec2::new(180.0, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        open_in_explorer(&parent);
+                    }
+                }
+            }
+
+            if !self.errors.is_empty() || !self.warnings.is_empty() {
                 ui.add_space(8.0);
                 if ui
                     .add(
-                        egui::Button::new("Open Output Folder")
-                            .min_size(Vec2::new(180.0, 30.0)),
+                        egui::Button::new(RichText::new("Open Error Log").color(Color32::from_gray(200)))
+                            .fill(Color32::from_gray(50))
+                            .min_size(Vec2::new(140.0, 30.0)),
                     )
                     .clicked()
                 {
-                    open_in_explorer(&parent);
+                    open_in_explorer(&encoder::error_log_path());
                 }
             }
-        }
+        });
 
         ui.add_space(10.0);
     }
@@ -979,7 +1043,7 @@ fn open_in_explorer(path: &Path) {
 }
 
 // Converts an f64 MB value to a display string without unnecessary decimal places
-// `50.0` → `"50"`, `1.5` → `"1.5"`, `150.0` → `"150"`
+// 50.0 -> "50", 1.5 -> "1.5", 150.0 -> "150"
 fn mb_to_str(mb: f64) -> String {
     if mb.fract() == 0.0 {
         format!("{}", mb as u64)
