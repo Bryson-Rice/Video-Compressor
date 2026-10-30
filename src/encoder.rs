@@ -917,6 +917,9 @@ fn compress_video_inner(
     let end_secs = opts.trim_end.unwrap_or(info.duration_secs);
     let effective_duration = (end_secs - start_secs).max(1.0);
 
+    // Encoding to a target at or above the source size can't shrink anything, it only
+    // costs quality. With a trim the comparison is against the trimmed portion, since
+    // that's all that would be written
     let trimmed = opts.trim_start.is_some() || opts.trim_end.is_some();
     let range_secs = (end_secs - start_secs).clamp(0.0, info.duration_secs);
     let range_mb = info.size_mb * range_secs / info.duration_secs;
@@ -963,7 +966,8 @@ fn compress_video_inner(
         input_args.push(format!("{}", end_secs - start_secs));
     }
 
-    // ffmpeg's default mapping silently keeps only one audio track so map them all
+    // ffmpeg's default mapping silently keeps only one audio track, so map them all.
+    // The `?` stops videos with no audio from erroring
     let mut audio_args: Vec<String> = if opts.mute {
         vec!["-an".into()]
     } else {
@@ -1024,7 +1028,8 @@ fn compress_video_inner(
     result.map(|_| Outcome::Done(output))
 }
 
-// Unhandled edge cases error handling
+// Unhandled edge cases tend to show up as silent differences from the source rather than
+// as errors, so this reports them instead of waiting for a user to notice
 fn verify_output(
     src: &VideoInfo,
     src_hdr: &Option<HdrStaticMeta>,
@@ -1070,7 +1075,7 @@ fn verify_output(
             out.color_transfer.as_deref().unwrap_or("none")
         ));
     }
-    // Only x264/x265 can be handed HDR metadata
+    // Only x264/x265 can be handed HDR metadata, so only check where we could have preserved it
     if src_hdr.is_some()
         && matches!(codec, VideoCodec::H264 | VideoCodec::Hevc)
         && read_hdr_meta(&out, output).is_none()
@@ -1098,6 +1103,15 @@ fn append_log_note(file: &str, text: &str) {
     }
 }
 
+// Two-pass rate control can fail on some sources. x264 fails with
+// "Incomplete MB-tree stats file" - pass 1 and pass 2 each decode the
+// source independently, and if they land on different frame counts (VFR
+// timestamps, odd B-frame reordering, etc.) pass 2 runs past the end of
+// pass 1's per-frame stats. It's a source-file quirk, not an app bug, and
+// it's not reliably detectable up front - so on any two-pass failure this
+// retries once. For x264 the retry switches MB-tree off, which removes the
+// cross-pass dependency at the cost of slightly less efficient rate control;
+// other codecs have no equivalent switch, so they retry as single-pass
 fn run_two_pass(
     ffmpeg: &Path,
     input_args: &[String],
