@@ -172,8 +172,6 @@ fn get_image_info(path: &Path) -> Result<ImageInfo, String> {
 }
 
 
-// A bin/ folder is checked as well as the exe's own folder so a bundled
-// layout works without copying the tools next to the executable
 fn find_tool(name: &str) -> PathBuf {
     // Per platform because one bundle can hold both builds: Linux must never pick
     // up ffmpeg.exe, and Windows must never pick up ffmpeg.bin
@@ -196,11 +194,12 @@ fn find_tool(name: &str) -> PathBuf {
             }
         }
     }
+    if let Some(embedded) = crate::embedded_tools::path(name) {
+        return embedded;
+    }
     PathBuf::from(name)
 }
 
-// Zip extraction, git checkouts and some file managers drop the executable bit, and
-// spawning then fails with "Permission denied" even though the file is right there
 #[cfg(unix)]
 fn ensure_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;

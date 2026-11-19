@@ -11,6 +11,8 @@ use encoder::{
     CancelToken, CompressOptions, EncoderMessage, FileInfo,
 };
 
+mod embedded_tools;
+
 #[cfg(target_os = "windows")]
 mod windows_shell;
 
@@ -19,6 +21,8 @@ mod windows_shell;
 mod settings;
 
 fn main() -> eframe::Result<()> {
+    std::thread::spawn(embedded_tools::prepare);
+
     #[cfg(target_os = "windows")]
     {
         if let Ok(exe) = std::env::current_exe() {
