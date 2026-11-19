@@ -14,6 +14,10 @@ use encoder::{
 #[cfg(target_os = "windows")]
 mod windows_shell;
 
+// macOS/Linux settings live in a JSON file (Windows uses the registry via windows_shell)
+#[cfg(not(target_os = "windows"))]
+mod settings;
+
 fn main() -> eframe::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -56,9 +60,8 @@ fn main() -> eframe::Result<()> {
 
             let mut app = App::default();
 
-            // Registry settings only exist on Windows (loaded in App::default());
-            // eframe's cross-platform storage covers these two so custom MB
-            // targets also persist on macOS/Linux
+            // Registry (Windows) / JSON file (macOS, Linux) settings are loaded in
+            // App::default(); eframe's storage below also restores the custom MB targets
             if let Some(storage) = cc.storage {
                 if let Some(s) = storage.get_string("custom_mb_video") {
                     if let Ok(v) = s.parse::<f64>() {
@@ -174,7 +177,7 @@ struct App {
 
 impl App {
     // (custom_mb_video, custom_mb_image, mute, two_pass, output_dir)
-    // Falls back to defaults on non-Windows builds or first run
+    // Falls back to defaults on first run
     fn load_saved_settings() -> (f64, f64, bool, bool, Option<PathBuf>) {
         #[cfg(target_os = "windows")]
         {
@@ -182,13 +185,23 @@ impl App {
             (s.custom_mb_video, s.custom_mb_image, s.mute, s.two_pass, s.output_dir)
         }
         #[cfg(not(target_os = "windows"))]
-        { (50.0, 5.0, false, true, None) }
+        {
+            let s = settings::load_settings();
+            (s.custom_mb_video, s.custom_mb_image, s.mute, s.two_pass, s.output_dir)
+        }
     }
 
-    // No-op on non-Windows builds - nowhere durable to put settings there yet
     fn persist_settings(&self) {
         #[cfg(target_os = "windows")]
         windows_shell::save_settings(&windows_shell::AppSettings {
+            custom_mb_video: self.custom_mb_video,
+            custom_mb_image: self.custom_mb_image,
+            mute: self.mute,
+            two_pass: self.two_pass,
+            output_dir: self.output_dir.clone(),
+        });
+        #[cfg(not(target_os = "windows"))]
+        settings::save_settings(&settings::AppSettings {
             custom_mb_video: self.custom_mb_video,
             custom_mb_image: self.custom_mb_image,
             mute: self.mute,
