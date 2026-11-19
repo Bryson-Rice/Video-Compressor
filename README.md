@@ -1,6 +1,6 @@
 # Video Compressor
 
-A small Windows desktop app for shrinking videos and images down to a target file size 
+A small Windows and Linux desktop app for shrinking videos and images down to a target file size 
 
 ## Features
 
@@ -17,15 +17,23 @@ A small Windows desktop app for shrinking videos and images down to a target fil
 
 ## Building
 
-Requires Rust and, for Windows builds made on macOS/Linux, `mingw-w64` (for `windres`):
+Requires Rust.
+
+**Windows** (cross-compiling from macOS/Linux needs `mingw-w64` for `windres`):
 
 ```
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-`ffmpeg.exe` and `ffprobe.exe` are bundled in `bin/` and used at runtime.
+**Linux** (build on Linux; needs GTK3 and windowing headers, e.g. on Debian/Ubuntu
+`sudo apt install build-essential pkg-config libgtk-3-dev libxkbcommon-dev libwayland-dev libx11-dev`):
+
+```
+cargo build --release --target x86_64-unknown-linux-gnu
+```
 
 ## Notes
 
-- Settings (target size, mute, output folder, etc.) are saved to the registry under `HKCU\Software\VideoCompressor` and persist across launches.
-- Windows shell integration ("Open with") also registers itself under `HKCU`, so no admin rights are needed.
+- Settings (target size, mute, output folder, etc.) persist across launches: on Windows in the registry under `HKCU\Software\VideoCompressor`, on Linux in `~/.config/video-compressor/settings.json`.
+- Windows shell integration ("Open with") registers itself under `HKCU`
+- FFmpeg failure logs: `%LOCALAPPDATA%\VideoCompressor\logs` on Windows, `~/.local/state/video-compressor/logs` on Linux.
